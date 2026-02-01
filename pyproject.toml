@@ -1,0 +1,22 @@
+[project]
+name = "shopping-agent"
+version = "0.1.0"
+description = "Autonomous shopping agent for Paytato"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "playwright>=1.40.0",
+    "httpx>=0.25.0",
+    "pydantic>=2.5.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+agent = "agent.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["agent"]
