@@ -16,7 +16,7 @@ from .keywords import KeywordsClient
 from .prompts import PROMPT_IDS
 from .shopper import JoyBuyShopper
 from .tracing import workflow, task
-from .types import AgentOutput, Budget, ShoppingPlan
+from .types import AgentOutput, Budget, CartJson, ShoppingPlan
 from .validator import validate_cart
 
 # Setup logging
@@ -69,6 +69,34 @@ async def create_shopping_plan(
     return plan
 
 
+@task(name="save_json_file")
+async def save_json_file(path: Path, payload: dict) -> None:
+    """Persist structured output to disk."""
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+
+@task(name="build_agent_output")
+async def build_agent_output(
+    plan: ShoppingPlan,
+    cart: CartJson,
+    validation,
+) -> AgentOutput:
+    """Build final AgentOutput model."""
+    return AgentOutput(
+        shopping_plan=plan,
+        cart=cart,
+        validation=validation,
+        success=validation.decision != "REJECT",
+    )
+
+
+@task(name="ensure_output_dir")
+async def ensure_output_dir(output_dir: Path) -> None:
+    """Ensure output directory exists."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+
 @workflow(name="shopping_agent_workflow")
 async def run_agent(
     requirements: str,
@@ -98,7 +126,7 @@ async def run_agent(
     if not api_key:
         raise ValueError("KEYWORDS_API_KEY not set. Check .env file.")
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    await ensure_output_dir(output_dir)
 
     async with KeywordsClient(api_key) as keywords:
         # Step 1: Convert requirements to shopping plan
@@ -110,8 +138,7 @@ async def run_agent(
 
         # Save plan
         plan_path = output_dir / "shopping_plan.json"
-        with open(plan_path, "w") as f:
-            json.dump(plan.model_dump(), f, indent=2)
+        await save_json_file(plan_path, plan.model_dump())
         logger.info(f"Saved plan to {plan_path}")
 
         # Step 2: Shop autonomously
@@ -133,8 +160,7 @@ async def run_agent(
 
         # Save cart
         cart_path = output_dir / "cart.json"
-        with open(cart_path, "w") as f:
-            json.dump(cart.model_dump(), f, indent=2)
+        await save_json_file(cart_path, cart.model_dump())
         logger.info(f"Saved cart to {cart_path}")
 
         # Step 3: Validate cart against plan
@@ -151,22 +177,15 @@ async def run_agent(
 
         # Save validation
         validation_path = output_dir / "validation.json"
-        with open(validation_path, "w") as f:
-            json.dump(validation.model_dump(), f, indent=2)
+        await save_json_file(validation_path, validation.model_dump())
         logger.info(f"Saved validation to {validation_path}")
 
         # Build final output
-        output = AgentOutput(
-            shopping_plan=plan,
-            cart=cart,
-            validation=validation,
-            success=validation.decision != "REJECT",
-        )
+        output = await build_agent_output(plan, cart, validation)
 
         # Save complete output
         output_path = output_dir / "agent_output.json"
-        with open(output_path, "w") as f:
-            json.dump(output.model_dump(), f, indent=2)
+        await save_json_file(output_path, output.model_dump())
         logger.info(f"Saved complete output to {output_path}")
 
         return output

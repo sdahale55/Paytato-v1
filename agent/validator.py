@@ -31,45 +31,87 @@ async def validate_cart(
         ValidationResult with decision, flags, and reasoning
     """
     # Serialize for the prompt
-    plan_json = json.dumps(plan.model_dump(), indent=2)
-    cart_json = json.dumps(cart.model_dump(), indent=2)
+    plan_json, cart_json = await _serialize_plan_cart(plan, cart)
 
     # Call Keywords AI with prompt management
+    prompt_vars = await _build_validation_variables(plan_json, cart_json, cart)
+    prompt_meta = await _build_validation_metadata(plan, cart)
+
     result = await keywords_client.complete(
         prompt_id=PROMPT_IDS["cart_vs_plan_validator"],
-        variables={
-            "plan_json": plan_json,
-            "cart_json": cart_json,
-            "merchant_origin": cart.merchant_origin,
-            "total_cents": str(cart.totals.total_cents),
-        },
+        variables=prompt_vars,
         session_id=cart.cart_id,
-        metadata={
-            "stage": "cart_validation",
-            "merchant_origin": cart.merchant_origin,
-            "cart_hash": cart.cart_fingerprint_sha256,
-            "total_cents": cart.totals.total_cents,
-            "plan_id": plan.plan_id,
-        },
+        metadata=prompt_meta,
     )
 
     # Parse result into ValidationResult
-    decision = result.get("decision", "ALLOW_WITH_FLAGS")
-    if decision not in ("ALLOW", "ALLOW_WITH_FLAGS", "REJECT"):
-        logger.warning(f"Unknown decision: {decision}, defaulting to ALLOW_WITH_FLAGS")
-        decision = "ALLOW_WITH_FLAGS"
-
-    validation = ValidationResult(
-        decision=decision,
-        flags=result.get("flags", []),
-        reasoning=result.get("reasoning"),
-    )
+    validation = await _parse_validation_result(result)
 
     logger.info(f"Validation result: {validation.decision}")
     for flag in validation.flags:
         logger.info(f"  Flag: {flag}")
 
     return validation
+
+
+@task(name="serialize_plan_cart")
+async def _serialize_plan_cart(
+    plan: ShoppingPlan,
+    cart: CartJson,
+) -> tuple[str, str]:
+    """Serialize plan and cart to JSON strings."""
+    plan_json = json.dumps(plan.model_dump(), indent=2)
+    cart_json = json.dumps(cart.model_dump(), indent=2)
+    return plan_json, cart_json
+
+
+@task(name="build_validation_variables")
+async def _build_validation_variables(
+    plan_json: str,
+    cart_json: str,
+    cart: CartJson,
+) -> dict:
+    """Build prompt variables for validation."""
+    return {
+        "plan_json": plan_json,
+        "cart_json": cart_json,
+        "merchant_origin": cart.merchant_origin,
+        "total_cents": str(cart.totals.total_cents),
+    }
+
+
+@task(name="build_validation_metadata")
+async def _build_validation_metadata(
+    plan: ShoppingPlan,
+    cart: CartJson,
+) -> dict:
+    """Build metadata for validation tracing."""
+    return {
+        "stage": "cart_validation",
+        "merchant_origin": cart.merchant_origin,
+        "cart_hash": cart.cart_fingerprint_sha256,
+        "total_cents": cart.totals.total_cents,
+        "plan_id": plan.plan_id,
+    }
+
+
+@task(name="parse_validation_result")
+async def _parse_validation_result(result) -> ValidationResult:
+    """Normalize validation result payload."""
+    if result is None or not isinstance(result, dict):
+        logger.warning("Validation result is not a dict, defaulting to ALLOW_WITH_FLAGS")
+        result = {}
+
+    decision = result.get("decision", "ALLOW_WITH_FLAGS")
+    if decision not in ("ALLOW", "ALLOW_WITH_FLAGS", "REJECT"):
+        logger.warning(f"Unknown decision: {decision}, defaulting to ALLOW_WITH_FLAGS")
+        decision = "ALLOW_WITH_FLAGS"
+
+    return ValidationResult(
+        decision=decision,
+        flags=result.get("flags", []),
+        reasoning=result.get("reasoning"),
+    )
 
 
 def quick_validate(plan: ShoppingPlan, cart: CartJson) -> ValidationResult:
