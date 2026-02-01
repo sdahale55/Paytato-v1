@@ -17,7 +17,7 @@ from .paytato import PaytatoClient
 from .prompts import PROMPT_IDS
 from .shopper import JoyBuyShopper
 from .tracing import workflow, task
-from .types import AgentOutput, Budget, CartJson, ShoppingPlan
+from .types import AgentOutput, Budget, CartJson, PaymentMethod, PaymentResult, ShoppingPlan
 from .validator import validate_cart
 
 # Setup logging
@@ -107,6 +107,7 @@ async def run_agent(
     domain: str | None = None,
     instructions: str | None = None,
     paytato: PaytatoClient | None = None,
+    mock_payload: PaymentMethod | None = None,
 ) -> tuple[AgentOutput, dict | None]:
     """
     Run the shopping agent with the given requirements.
@@ -206,13 +207,83 @@ async def run_agent(
             logger.info("=" * 50)
             
             intent_result = await paytato.submit_intent(plan, cart)
+            intent_id = str(intent_result.get("intentId", ""))
             
-            # Save intent result
-            intent_path = output_dir / "paytato_intent.json"
-            await save_json_file(intent_path, intent_result)
-            logger.info(f"Saved Paytato intent to {intent_path}")
+            if not intent_id:
+                logger.error("Paytato response missing intentId")
+                return output, intent_result
+
+            # Step 5: Wait for user approval
+            logger.info("=" * 50)
+            logger.info("STEP 5: Polling Paytato for credentials...")
+            logger.info("=" * 50)
+            
+            payment_method = mock_payload
+            if not payment_method:
+                payment_method = await paytato.wait_for_approval(intent_id)
+            else:
+                logger.info("Using mock payment payload provided via CLI")
+            
+            if payment_method:
+                logger.info(f"Agent successfully received payment data for: {payment_method.cardholder_name}")
+                # Step 6: Execute payment
+                logger.info("=" * 50)
+                logger.info("STEP 6: Executing payment...")
+                logger.info("=" * 50)
+                
+                try:
+                    # 6.1 Proceed to checkout
+                    if await shopper.proceed_to_checkout():
+                        # 6.2 Fill payment form
+                        if await shopper.fill_payment_form(payment_method):
+                            # IMPORTANT: Wipe card data from memory after filling
+                            payment_method = None
+                            
+                            logger.info("=" * 50)
+                            logger.info("PAUSING 15 SECONDS BEFORE SUBMITTING PAYMENT...")
+                            logger.info("=" * 50)
+                            await asyncio.sleep(15)
+                            
+                            # 6.3 Complete purchase
+                            payment_result = await shopper.complete_purchase()
+                            cart.payment_result = payment_result
+                            
+                            # Step 7: Report back to Paytato
+                            logger.info("=" * 50)
+                            logger.info("STEP 7: Reporting payment result to Paytato...")
+                            logger.info("=" * 50)
+                            
+                            metadata = {
+                                "success": payment_result.success,
+                                "confirmation_number": payment_result.confirmation_number,
+                                "receipt_url": payment_result.receipt_url,
+                                "error_message": payment_result.error_message,
+                            }
+                            await paytato.complete_intent(intent_id, metadata=metadata)
+                            
+                            if payment_result.success:
+                                logger.info("Payment completed successfully!")
+                            else:
+                                logger.error(f"Payment failed: {payment_result.error_message}")
+                        else:
+                            payment_method = None
+                            logger.error("Failed to fill payment form")
+                            await paytato.complete_intent(intent_id, metadata={"success": False, "error_message": "Failed to fill payment form"})
+                    else:
+                        logger.error("Failed to navigate to checkout")
+                        await paytato.complete_intent(intent_id, metadata={"success": False, "error_message": "Failed to navigate to checkout"})
+                except Exception as e:
+                    payment_method = None
+                    logger.error(f"Unexpected error during payment: {e}")
+                    await paytato.complete_intent(intent_id, metadata={"success": False, "error_message": str(e)})
+            else:
+                logger.warning("Approval not received or timed out. Shutting down.")
+        
         elif paytato and not output.success:
             logger.warning("Skipping Paytato intent submission - validation failed")
+
+        # Ensure browser is closed at the end
+        await shopper._close_browser()
 
         return output, intent_result
 
@@ -257,6 +328,27 @@ Examples:
         type=str,
         default=None,
         help="Keywords AI API key (defaults to KEYWORDS_API_KEY env var)",
+    )
+
+    parser.add_argument(
+        "--paytato-key",
+        type=str,
+        default=None,
+        help="Paytato API key (defaults to PAYTATO_API_KEY env var)",
+    )
+
+    parser.add_argument(
+        "--private-key",
+        type=str,
+        default=None,
+        help="PayFill Private Key for decryption (defaults to PAYFILL_PRIVATE_KEY env var)",
+    )
+
+    parser.add_argument(
+        "--mock-payload",
+        type=str,
+        default=None,
+        help="JSON string or path to JSON file containing mock Paytato credentials for testing",
     )
 
     parser.add_argument(
@@ -312,8 +404,44 @@ Examples:
     # Run agent
     async def run_with_paytato() -> tuple[AgentOutput, dict | None]:
         """Run agent with Paytato integration."""
-        paytato_key = os.getenv("PAYTATO_API_KEY")
+        paytato_key = args.paytato_key or os.getenv("PAYTATO_API_KEY")
         
+        # Parse mock payload if provided
+        mock_data = None
+        if args.mock_payload:
+            try:
+                if Path(args.mock_payload).exists():
+                    with open(args.mock_payload) as f:
+                        mock_json = json.load(f)
+                else:
+                    mock_json = json.loads(args.mock_payload)
+                
+                # Check if it's the raw Paytato format or our PaymentMethod format
+                # If it has 'cardNumber', it's the raw format that needs mapping
+                if "cardNumber" in mock_json:
+                    from .types import Address, ContactInfo
+                    mock_data = PaymentMethod(
+                        pan=mock_json.get("cardNumber", ""),
+                        exp_month=str(mock_json.get("expiryMonth", "")),
+                        exp_year=str(mock_json.get("expiryYear", "")),
+                        cvv=mock_json.get("cvv", ""),
+                        cardholder_name=mock_json.get("cardholderName", ""),
+                        billing_zip=mock_json.get("billingAddress", {}).get("zip") if mock_json.get("billingAddress") else None,
+                        billingAddress=Address(**mock_json.get("billingAddress")) if mock_json.get("billingAddress") else None,
+                        email=mock_json.get("email"),
+                        phone=mock_json.get("phone"),
+                        contactInfo=ContactInfo(**mock_json.get("contactInfo")) if mock_json.get("contactInfo") else None,
+                    )
+                else:
+                    mock_data = PaymentMethod(**mock_json)
+            except Exception as e:
+                logger.error(f"Failed to parse mock payload: {e}")
+                sys.exit(1)
+
+        # Set private key in env if provided via CLI
+        if args.private_key:
+            os.environ["PAYFILL_PRIVATE_KEY"] = args.private_key
+            
         if paytato_key:
             async with PaytatoClient(paytato_key) as paytato:
                 return await run_agent(
@@ -324,6 +452,7 @@ Examples:
                     domain=args.domain,
                     instructions=args.instructions,
                     paytato=paytato,
+                    mock_payload=mock_data,
                 )
         else:
             logger.warning("PAYTATO_API_KEY not set - running without Paytato integration")
@@ -334,6 +463,7 @@ Examples:
                 api_key=args.api_key,
                 domain=args.domain,
                 instructions=args.instructions,
+                mock_payload=mock_data,
             )
 
     try:
@@ -361,14 +491,25 @@ Examples:
             print(f"  - {args.output_dir}/paytato_intent.json")
             print()
             print("=" * 60)
-            print("  PAYTATO INTENT SUBMITTED")
+            print("  PAYTATO STATUS")
             print("=" * 60)
             print()
             print(f"Intent ID:  {intent_result.get('intentId')}")
             print(f"Status:     {intent_result.get('status')}")
+            
+            # Check if payment was executed
+            if output.cart.payment_result:
+                pr = output.cart.payment_result
+                print(f"Payment:    {'SUCCESS' if pr.success else 'FAILED'}")
+                if pr.confirmation_number:
+                    print(f"Conf #:     {pr.confirmation_number}")
+                if pr.error_message:
+                    print(f"Error:      {pr.error_message}")
+            else:
+                print("Payment:    Pending/Not executed (approval timeout or browser closed)")
+            
             print()
-            print("Agent has submitted payment intent to Paytato and is now shutting down.")
-            print("Payment approval will be handled by Paytato.")
+            print("Agent run complete.")
         else:
             print()
             if not output.success:

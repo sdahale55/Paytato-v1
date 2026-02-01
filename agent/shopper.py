@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from playwright.async_api import Page, async_playwright
@@ -12,12 +14,24 @@ from playwright.async_api import Page, async_playwright
 from .keywords import KeywordsClient
 from .prompts import PROMPT_IDS
 from .tracing import task
-from .types import CartItem, CartJson, CartTotals, ShoppingItem, ShoppingPlan
+from .types import (
+    BrowserProfile,
+    CartItem,
+    CartJson,
+    CartTotals,
+    PaymentMethod,
+    PaymentResult,
+    ShoppingItem,
+    ShoppingPlan,
+)
 
 if TYPE_CHECKING:
     from playwright.async_api import Browser, BrowserContext
 
 logger = logging.getLogger(__name__)
+
+# Default profile directory for persistent browser sessions
+DEFAULT_PROFILE_DIR = Path(__file__).parent.parent / "output" / "browser_profile"
 
 
 class JoyBuyShopper:
@@ -29,6 +43,8 @@ class JoyBuyShopper:
     - Home page lists all products with "Add" buttons
     - No search functionality
     - Cart accessible via /cart link
+    
+    Uses a persistent browser profile so PayFill can continue the session.
     """
 
     DEFAULT_DOMAIN = "https://joy-buy-test.lovable.app"
@@ -40,54 +56,94 @@ class JoyBuyShopper:
         headless: bool = False,
         domain: str | None = None,
         instructions: str | None = None,
+        profile_dir: Path | None = None,
     ):
         self.plan = plan
         self.keywords = keywords_client
         self.headless = headless
         self.base_url = domain.rstrip("/") if domain else self.DEFAULT_DOMAIN
         self.instructions = instructions
+        self._profile_dir = profile_dir or DEFAULT_PROFILE_DIR
+        self._playwright = None
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
         self._page: Page | None = None
         self._added_items: list[CartItem] = []
 
     @task(name="shopping_browse_and_add")
-    async def shop(self) -> CartJson:
+    async def shop(self, keep_browser_open: bool = True) -> CartJson:
         """
         Execute the shopping plan and return a CartJson.
 
         This navigates the store, adds items to cart, and extracts the cart state.
         Does NOT submit payment.
+        
+        If keep_browser_open=True (default), the browser stays open for PayFill
+        to connect and continue the session. The CDP URL is included in cart.json.
         """
-        async with async_playwright() as p:
-            # Launch browser (visible for demo)
-            self._browser = await p.chromium.launch(headless=self.headless)
-            self._context = await self._browser.new_context(
-                viewport={"width": 1280, "height": 800}
-            )
-            self._page = await self._context.new_page()
+        # Ensure profile directory exists
+        self._profile_dir.mkdir(parents=True, exist_ok=True)
+        profile_path = str(self._profile_dir.resolve())
+        logger.info(f"Using persistent browser profile: {profile_path}")
+        
+        self._playwright = await async_playwright().start()
+        
+        # Launch browser with persistent context for session continuity
+        # Use --remote-debugging-port=0 to get auto-assigned port for CDP
+        self._context = await self._playwright.chromium.launch_persistent_context(
+            user_data_dir=profile_path,
+            channel="chrome",  # Use system Chrome, not bundled Chromium
+            headless=self.headless,
+            viewport={"width": 1280, "height": 800},
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--remote-debugging-port=0",  # Auto-assign CDP port
+            ],
+        )
+        self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
 
-            try:
-                # Navigate to store
-                logger.info(f"Navigating to {self.base_url}")
-                await self._page.goto(self.base_url, wait_until="networkidle")
-                await self._page.wait_for_timeout(2000)  # Let React hydrate
+        try:
+            # Navigate to store
+            logger.info(f"Navigating to {self.base_url}")
+            await self._page.goto(self.base_url, wait_until="networkidle")
+            await self._page.wait_for_timeout(2000)  # Let React hydrate
 
-                # Get all available products on the page
-                products = await self._get_available_products()
-                logger.info(f"Found {len(products)} products on store")
+            # Get all available products on the page
+            products = await self._get_available_products()
+            logger.info(f"Found {len(products)} products on store")
 
-                # Process each item in the plan
-                for item in self.plan.items:
-                    await self._add_item_to_cart(item, products)
+            # Process each item in the plan
+            for item in self.plan.items:
+                await self._add_item_to_cart(item, products)
 
-                # Navigate to cart/checkout and extract state
-                cart = await self._extract_cart_state()
-                return cart
+            # Navigate to cart/checkout and extract state
+            cart = await self._extract_cart_state(profile_path)
+            
+            # Since we are keeping the browser open in the same process,
+            # we don't need to pass CDP URL to another process.
+            if not keep_browser_open:
+                await self._close_browser()
+            
+            return cart
 
-            finally:
-                if self._browser:
-                    await self._browser.close()
+        except Exception as e:
+            # On error, close browser
+            await self._close_browser()
+            raise
+    
+    async def _close_browser(self) -> None:
+        """Close the browser and cleanup."""
+        if self._page:
+            logger.info("Waiting for browser storage to sync...")
+            await self._page.wait_for_timeout(2000)
+        
+        if self._context:
+            await self._context.close()
+            logger.info("Browser closed.")
+        
+        if self._playwright:
+            await self._playwright.stop()
+            self._playwright = None
 
     @task(name="collect_products_catalog")
     async def _get_available_products(self) -> list[dict]:
@@ -331,8 +387,290 @@ class JoyBuyShopper:
         # This prevents adding wrong items to cart
         logger.warning(f"Could not find Add button for product: {product_name}")
 
+    @task(name="proceed_to_checkout")
+    async def proceed_to_checkout(self) -> bool:
+        """Navigate from cart to the checkout/payment page."""
+        logger.info("Looking for checkout button...")
+        
+        # Common checkout button selectors
+        selectors = [
+            'button:has-text("Proceed to Checkout")',
+            'button:has-text("Checkout")',
+            'button:has-text("Continue to Checkout")',
+            'button:has-text("Go to Checkout")',
+            'a:has-text("Proceed to Checkout")',
+            'a:has-text("Checkout")',
+            '[data-testid="checkout-button"]',
+            '[data-testid="proceed-checkout"]',
+            '.checkout-button',
+            '#checkout-button',
+            'a[href*="/checkout"]',
+        ]
+        
+        for selector in selectors:
+            try:
+                locator = self._page.locator(selector).first
+                if await locator.is_visible(timeout=2000):
+                    logger.info(f"Found checkout button: {selector}")
+                    await locator.click()
+                    await self._page.wait_for_load_state("networkidle")
+                    await self._page.wait_for_timeout(2000)
+                    logger.info(f"Navigated to checkout page: {self._page.url}")
+                    return True
+            except Exception:
+                continue
+                
+        logger.warning("Could not find checkout button.")
+        return False
+
+    @task(name="fill_payment_form")
+    async def fill_payment_form(self, card: PaymentMethod) -> bool:
+        """Fill out the credit card and contact information form."""
+        logger.info("Filling payment and contact form...")
+        
+        # Define field selector groups
+        field_selectors = {
+            "pan": [
+                'input[name="cardNumber"]',
+                'input[name="card-number"]',
+                'input[name="cc-number"]',
+                'input[id="cardNumber"]',
+                'input[id="card-number"]',
+                'input[autocomplete="cc-number"]',
+                'input[data-testid="card-number"]',
+                'input[placeholder*="card number" i]',
+                'input[aria-label*="card number" i]',
+            ],
+            "cvv": [
+                'input[name="cvv"]',
+                'input[name="cvc"]',
+                'input[name="securityCode"]',
+                'input[name="cc-csc"]',
+                'input[autocomplete="cc-csc"]',
+                'input[data-testid="cvv"]',
+                'input[placeholder*="CVV" i]',
+                'input[placeholder*="CVC" i]',
+                'input[placeholder*="security" i]',
+            ],
+            "name": [
+                'input[name="cardholderName"]',
+                'input[name="cardholder-name"]',
+                'input[name="cc-name"]',
+                'input[autocomplete="cc-name"]',
+                'input[placeholder*="name on card" i]',
+                'input[placeholder*="cardholder" i]',
+            ],
+            "zip": [
+                'input[name="billingZip"]',
+                'input[name="postalCode"]',
+                'input[name="postal-code"]',
+                'input[name="zip"]',
+                'input[autocomplete="postal-code"]',
+                'input[placeholder*="zip" i]',
+                'input[placeholder*="postal" i]',
+            ],
+            "email": [
+                'input[name="email"]',
+                'input[type="email"]',
+                'input[autocomplete="email"]',
+                'input[placeholder*="email" i]',
+            ],
+            "phone": [
+                'input[name="phone"]',
+                'input[name="telephone"]',
+                'input[name="mobile"]',
+                'input[autocomplete="tel"]',
+                'input[placeholder*="phone" i]',
+            ],
+            "firstName": [
+                'input[name="firstName"]',
+                'input[name="first-name"]',
+                'input[autocomplete="given-name"]',
+                'input[placeholder*="first name" i]',
+            ],
+            "lastName": [
+                'input[name="lastName"]',
+                'input[name="last-name"]',
+                'input[autocomplete="family-name"]',
+                'input[placeholder*="last name" i]',
+            ],
+            "address": [
+                'input[name="address"]',
+                'input[name="street"]',
+                'input[name="address1"]',
+                'input[autocomplete="address-line1"]',
+                'input[placeholder*="address" i]',
+            ],
+            "city": [
+                'input[name="city"]',
+                'input[autocomplete="address-level2"]',
+                'input[placeholder*="city" i]',
+            ],
+            "state": [
+                'input[name="state"]',
+                'input[name="region"]',
+                'input[autocomplete="address-level1"]',
+                'input[placeholder*="state" i]',
+                'select[name="state"]',
+            ],
+            "country": [
+                'input[name="country"]',
+                'select[name="country"]',
+                'input[autocomplete="country"]',
+            ]
+        }
+
+        async def fill_field(field_name, selectors, value):
+            if not value:
+                return False
+            for selector in selectors:
+                try:
+                    locator = self._page.locator(selector).first
+                    if await locator.is_visible(timeout=1000):
+                        await locator.fill(value)
+                        logger.info(f"Filled {field_name}")
+                        return True
+                except Exception:
+                    continue
+            return False
+
+        # 1. Fill Contact Info
+        if card.email:
+            await fill_field("Email", field_selectors["email"], card.email)
+        if card.phone:
+            await fill_field("Phone", field_selectors["phone"], card.phone)
+        
+        if card.contactInfo:
+            await fill_field("First Name", field_selectors["firstName"], card.contactInfo.firstName)
+            await fill_field("Last Name", field_selectors["lastName"], card.contactInfo.lastName)
+            await fill_field("Address", field_selectors["address"], card.contactInfo.address)
+            await fill_field("City", field_selectors["city"], card.contactInfo.city)
+            await fill_field("ZIP Code", field_selectors["zip"], card.contactInfo.zipCode)
+        
+        # 2. Fill Billing Info (if different or specifically for card)
+        if card.billingAddress:
+            await fill_field("Billing Street", field_selectors["address"], card.billingAddress.street)
+            await fill_field("Billing City", field_selectors["city"], card.billingAddress.city)
+            await fill_field("Billing State", field_selectors["state"], card.billingAddress.state)
+            await fill_field("Billing ZIP", field_selectors["zip"], card.billingAddress.zip)
+            await fill_field("Billing Country", field_selectors["country"], card.billingAddress.country)
+
+        # 3. Fill Card Details
+        # Fill PAN
+        if not await fill_field("PAN", field_selectors["pan"], card.pan):
+            logger.error("Failed to fill card number")
+            return False
+
+        # Fill Expiry (handling both combined MM/YY and separate fields)
+        expiry_filled = False
+        expiry_selectors = [
+            'input[name="expiry"]',
+            'input[name="cardExpiry"]',
+            'input[name="cc-exp"]',
+            'input[autocomplete="cc-exp"]',
+            'input[placeholder*="MM/YY" i]',
+        ]
+        
+        # Try combined first
+        for sel in expiry_selectors:
+            try:
+                locator = self._page.locator(sel).first
+                if await locator.is_visible(timeout=1000):
+                    month = card.exp_month.zfill(2)
+                    year = card.exp_year[-2:]
+                    await locator.fill(f"{month}/{year}")
+                    logger.info("Filled combined expiry")
+                    expiry_filled = True
+                    break
+            except Exception:
+                continue
+
+        if not expiry_filled:
+            # Try separate month/year
+            month_sel = ['input[name="expiryMonth"]', 'select[name="expiryMonth"]', 'input[autocomplete="cc-exp-month"]']
+            year_sel = ['input[name="expiryYear"]', 'select[name="expiryYear"]', 'input[autocomplete="cc-exp-year"]']
+            
+            m_filled = await fill_field("exp_month", month_sel, card.exp_month.zfill(2))
+            y_filled = await fill_field("exp_year", year_sel, card.exp_year[-2:])
+            expiry_filled = m_filled and y_filled
+
+        if not expiry_filled:
+            logger.error("Failed to fill expiry date")
+            return False
+
+        # Fill CVV
+        if not await fill_field("CVV", field_selectors["cvv"], card.cvv):
+            logger.error("Failed to fill security code")
+            return False
+
+        # Fill Name (optional but recommended)
+        await fill_field("Cardholder Name", field_selectors["name"], card.cardholder_name)
+        
+        # Fill ZIP (fallback)
+        if card.billing_zip:
+            await fill_field("Billing ZIP", field_selectors["zip"], card.billing_zip)
+
+        return True
+
+    @task(name="complete_purchase")
+    async def complete_purchase(self) -> PaymentResult:
+        """Submit the payment and capture the result."""
+        logger.info("Submitting order...")
+        
+        submit_selectors = [
+            'button[type="submit"]',
+            'button:has-text("Pay")',
+            'button:has-text("Place Order")',
+            'button:has-text("Complete Purchase")',
+            'button:has-text("Submit Order")',
+            '[data-testid="submit-button"]',
+        ]
+        
+        submit_button = None
+        for sel in submit_selectors:
+            try:
+                locator = self._page.locator(sel).first
+                if await locator.is_visible(timeout=2000):
+                    submit_button = locator
+                    break
+            except Exception:
+                continue
+
+        if not submit_button:
+            return PaymentResult(success=False, error_message="Could not find submit button")
+
+        await submit_button.click()
+        logger.info("Clicked submit. Waiting for confirmation...")
+        
+        # Wait for potential success indicators
+        await self._page.wait_for_timeout(5000)
+        
+        # Capture confirmation info
+        page_text = await self._page.inner_text("body")
+        current_url = self._page.url
+        
+        # Simple success detection
+        success_keywords = ["thank you", "confirmed", "order #", "receipt", "success"]
+        is_success = any(kw in page_text.lower() for kw in success_keywords)
+        
+        conf_number = None
+        if is_success:
+            import re
+            # Try to find order number pattern
+            match = re.search(r"order\s*(?:#|number|id)?[:\s]*([A-Z0-9-]+)", page_text, re.I)
+            if match:
+                conf_number = match.group(1)
+                logger.info(f"Captured confirmation number: {conf_number}")
+
+        return PaymentResult(
+            success=is_success,
+            confirmation_number=conf_number,
+            receipt_url=current_url,
+            error_message=None if is_success else "Could not confirm purchase success from page content"
+        )
+
     @task(name="extract_cart_state")
-    async def _extract_cart_state(self) -> CartJson:
+    async def _extract_cart_state(self, profile_path: str) -> CartJson:
         """Extract cart state from the checkout page."""
         # Navigate to cart
         logger.info("Navigating to cart...")
@@ -381,6 +719,11 @@ class JoyBuyShopper:
             total_cents=cart_data.get("total_cents") or 0,
         )
 
+        # Create browser profile info for PayFill handover
+        browser_profile = BrowserProfile(
+            user_data_dir=profile_path,
+        )
+
         cart = CartJson(
             plan_id=self.plan.plan_id,
             merchant_origin=self.base_url,
@@ -388,10 +731,13 @@ class JoyBuyShopper:
             items=items,
             totals=totals,
             expires_at=(datetime.utcnow() + timedelta(hours=1)).isoformat(),
+            browser_profile=browser_profile,
         )
 
         # Compute fingerprint
         cart.compute_fingerprint()
+        
+        logger.info(f"Cart ready for PayFill handover. Profile: {profile_path}")
 
         return cart
 

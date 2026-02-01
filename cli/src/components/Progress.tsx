@@ -19,6 +19,10 @@ const STEPS = [
   { id: 'add', label: 'Adding items to cart', pattern: /add|click|found match/i },
   { id: 'cart', label: 'Extracting cart state', pattern: /cart|extract/i },
   { id: 'validate', label: 'Validating cart', pattern: /validat/i },
+  { id: 'intent', label: 'Submitting payment intent', pattern: /intent|step 4/i },
+  { id: 'approval', label: 'Awaiting user approval', pattern: /approval|credentials|step 5/i },
+  { id: 'payment', label: 'Executing payment', pattern: /executing payment|filling payment|step 6/i },
+  { id: 'complete', label: 'Finalizing order', pattern: /reporting|complete|step 7/i },
 ];
 
 function getCurrentStep(logs: string[]): number {

@@ -115,6 +115,58 @@ class CartTotals(BaseModel):
     currency: Literal["USD", "EUR", "GBP"] = "USD"
 
 
+class Address(BaseModel):
+    """Physical address information."""
+    street: str | None = None
+    city: str | None = None
+    state: str | None = None
+    zip: str | None = None
+    country: str | None = None
+
+
+class ContactInfo(BaseModel):
+    """User contact information."""
+    firstName: str | None = None
+    lastName: str | None = None
+    address: str | None = None
+    city: str | None = None
+    zipCode: str | None = None
+
+
+class PaymentMethod(BaseModel):
+    """Plaintext payment method information."""
+    pan: str
+    exp_month: str
+    exp_year: str
+    cvv: str
+    cardholder_name: str
+    billing_zip: str | None = None
+    
+    # New fields from Paytato
+    billingAddress: Address | None = None
+    email: str | None = None
+    phone: str | None = None
+    contactInfo: ContactInfo | None = None
+
+
+class PaymentResult(BaseModel):
+    """Result of a payment execution."""
+    success: bool
+    confirmation_number: str | None = None
+    receipt_url: str | None = None
+    error_message: str | None = None
+    charged_amount_cents: int | None = None
+
+
+class BrowserProfile(BaseModel):
+    """Browser profile configuration for PayFill."""
+
+    user_data_dir: str | None = None  # Path to Chrome user data directory
+    profile_name: str | None = None   # Profile name within user data directory
+    executable_path: str | None = None  # Path to Chrome/Chromium executable
+    cdp_url: str | None = None  # CDP WebSocket URL for connecting to running browser
+
+
 class CartJson(BaseModel):
     """Complete cart state ready for checkout."""
 
@@ -130,6 +182,13 @@ class CartJson(BaseModel):
     cart_fingerprint_sha256: str = ""
     created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
     expires_at: str = ""
+    
+    # Browser profile for PayFill (optional)
+    browser_profile: BrowserProfile | None = None
+    
+    # Payment details (received after approval)
+    payment_method: PaymentMethod | None = None
+    payment_result: PaymentResult | None = None
 
     def compute_fingerprint(self) -> str:
         """Compute SHA256 fingerprint of cart contents."""

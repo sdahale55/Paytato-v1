@@ -77,6 +77,16 @@ export async function runAgent(options: RunAgentOptions): Promise<AgentOutput> {
           onProgress?.('Shopping autonomously...', line);
         } else if (line.includes('STEP 3')) {
           onProgress?.('Validating cart...', line);
+        } else if (line.includes('STEP 4')) {
+          onProgress?.('Submitting payment intent...', line);
+        } else if (line.includes('STEP 5')) {
+          onProgress?.('Awaiting Paytato approval...', line);
+        } else if (line.includes('STEP 6')) {
+          onProgress?.('Executing payment...', line);
+        } else if (line.includes('STEP 7')) {
+          onProgress?.('Reporting results to Paytato...', line);
+        } else if (line.includes('PAUSING 15 SECONDS')) {
+          onProgress?.('Pausing before final submission...', line);
         } else if (line.includes('Navigating')) {
           onProgress?.('Navigating to store...', line);
         } else if (line.includes('Found match')) {

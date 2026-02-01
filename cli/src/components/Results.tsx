@@ -29,6 +29,12 @@ export interface AgentOutput {
   cart: {
     items: CartItem[];
     totals: CartTotals;
+    payment_result?: {
+      success: boolean;
+      confirmation_number?: string;
+      receipt_url?: string;
+      error_message?: string;
+    };
   };
   validation: ValidationResult;
 }
@@ -119,6 +125,24 @@ export function Results({ output, onRestart }: ResultsProps) {
           </Text>
         </Box>
       </Box>
+
+      {/* Payment Result */}
+      {cart.payment_result && (
+        <Box marginLeft={2} flexDirection="column">
+          <Text bold underline>Payment Result:</Text>
+          <Box marginLeft={2} flexDirection="column">
+            <Text color={cart.payment_result.success ? 'green' : 'red'}>
+              Status: {cart.payment_result.success ? 'SUCCESS' : 'FAILED'}
+            </Text>
+            {cart.payment_result.confirmation_number && (
+              <Text>Confirmation #: {cart.payment_result.confirmation_number}</Text>
+            )}
+            {cart.payment_result.error_message && (
+              <Text color="red">Error: {cart.payment_result.error_message}</Text>
+            )}
+          </Box>
+        </Box>
+      )}
 
       {/* Validation */}
       <Box marginLeft={2} flexDirection="column">
