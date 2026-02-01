@@ -1,4 +1,4 @@
-"""Keywords AI REST client for LLM calls."""
+"""Keywords AI REST client for LLM calls with prompt management support."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 class KeywordsClient:
-    """Async client for Keywords AI chat completions API."""
+    """Async client for Keywords AI chat completions API with prompt management."""
 
     BASE_URL = "https://api.keywordsai.co/api/chat/completions"
 
@@ -30,10 +30,11 @@ class KeywordsClient:
 
     async def complete(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, str]] | None = None,
         *,
         model: str = "gpt-4o",
         prompt_id: str | None = None,
+        variables: dict[str, str] | None = None,
         user_id: str | None = None,
         session_id: str | None = None,
         metadata: dict[str, Any] | None = None,
@@ -42,10 +43,15 @@ class KeywordsClient:
         """
         Call Keywords AI chat completions endpoint.
 
+        Supports two modes:
+        1. Prompt Management: Pass prompt_id + variables to use dashboard prompts
+        2. Inline Messages: Pass messages directly (legacy mode)
+
         Args:
-            messages: Chat messages (system, user, assistant)
-            model: Model to use (default: gpt-4o)
-            prompt_id: Optional prompt identifier for tracking
+            messages: Chat messages (optional if using prompt management)
+            model: Model to use (ignored if prompt management with override=True)
+            prompt_id: Prompt ID from Keywords AI dashboard
+            variables: Variables to fill in prompt template
             user_id: Optional user identifier for tracking
             session_id: Optional session identifier for tracking
             metadata: Optional metadata dict for tracking
@@ -58,10 +64,24 @@ class KeywordsClient:
             raise RuntimeError("Client not initialized. Use 'async with' context.")
 
         # Build request payload
-        payload: dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-        }
+        payload: dict[str, Any] = {}
+
+        # Use prompt management if prompt_id and variables provided
+        if prompt_id and variables is not None:
+            payload["prompt"] = {
+                "prompt_id": prompt_id,
+                "variables": variables,
+                "override": True,  # Use dashboard config for model/temp
+            }
+            # Still need a placeholder message for API compatibility
+            payload["model"] = model
+            payload["messages"] = [{"role": "user", "content": "placeholder"}]
+        else:
+            # Legacy inline messages mode
+            if not messages:
+                raise ValueError("Either messages or (prompt_id + variables) must be provided")
+            payload["model"] = model
+            payload["messages"] = messages
 
         # Add JSON mode if requested
         if json_mode:
@@ -71,10 +91,9 @@ class KeywordsClient:
         customer_params: dict[str, Any] = {}
         if user_id:
             customer_params["customer_identifier"] = user_id
-        if metadata or prompt_id or session_id:
+        if metadata or session_id:
             customer_params["metadata"] = {
                 **(metadata or {}),
-                **({"prompt_id": prompt_id} if prompt_id else {}),
                 **({"session_id": session_id} if session_id else {}),
             }
         if customer_params:

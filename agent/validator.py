@@ -6,7 +6,7 @@ import json
 import logging
 
 from .keywords import KeywordsClient
-from .prompts import get_validation_messages
+from .prompts import PROMPT_IDS
 from .types import CartJson, ShoppingPlan, ValidationResult
 
 logger = logging.getLogger(__name__)
@@ -32,19 +32,15 @@ async def validate_cart(
     plan_json = json.dumps(plan.model_dump(), indent=2)
     cart_json = json.dumps(cart.model_dump(), indent=2)
 
-    # Build validation messages
-    messages = get_validation_messages(
-        plan_json=plan_json,
-        cart_json=cart_json,
-        merchant_origin=cart.merchant_origin,
-        total_cents=cart.totals.total_cents,
-    )
-
-    # Call Keywords AI
+    # Call Keywords AI with prompt management
     result = await keywords_client.complete(
-        messages=messages,
-        model="gpt-4o",
-        prompt_id="cart_vs_plan_validator",
+        prompt_id=PROMPT_IDS["cart_vs_plan_validator"],
+        variables={
+            "plan_json": plan_json,
+            "cart_json": cart_json,
+            "merchant_origin": cart.merchant_origin,
+            "total_cents": str(cart.totals.total_cents),
+        },
         session_id=cart.cart_id,
         metadata={
             "stage": "cart_validation",

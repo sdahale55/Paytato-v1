@@ -13,7 +13,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from .keywords import KeywordsClient
-from .prompts import get_intake_messages
+from .prompts import PROMPT_IDS
 from .shopper import JoyBuyShopper
 from .types import AgentOutput, Budget, ShoppingPlan
 from .validator import validate_cart
@@ -59,12 +59,10 @@ async def run_agent(
         logger.info("STEP 1: Converting requirements to shopping plan...")
         logger.info("=" * 50)
 
-        messages = get_intake_messages(requirements)
         plan_data = await keywords.complete(
-            messages=messages,
-            model="gpt-4o",
-            prompt_id="shopping_intake_to_plan",
-            metadata={"stage": "intake_plan", "prompt_version": "v1"},
+            prompt_id=PROMPT_IDS["shopping_intake_to_plan"],
+            variables={"user_requirements": requirements},
+            metadata={"stage": "intake_plan"},
         )
 
         # Parse into ShoppingPlan

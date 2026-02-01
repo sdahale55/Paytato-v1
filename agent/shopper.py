@@ -10,57 +10,13 @@ from typing import TYPE_CHECKING
 from playwright.async_api import Page, async_playwright
 
 from .keywords import KeywordsClient
+from .prompts import PROMPT_IDS
 from .types import CartItem, CartJson, CartTotals, ShoppingItem, ShoppingPlan
 
 if TYPE_CHECKING:
     from playwright.async_api import Browser, BrowserContext
 
 logger = logging.getLogger(__name__)
-
-
-# Prompt for finding the best matching product
-FIND_PRODUCT_PROMPT = """You are a shopping assistant. Given a list of available products and a shopping goal, identify the best matching product.
-
-Available products on this page (format: "INDEX. PRODUCT_NAME | DESCRIPTION | PRICE"):
-{products_text}
-
-Shopping goal: Find "{item_description}"
-
-Respond with JSON:
-{{
-  "found": true | false,
-  "product_index": 0,
-  "product_name": "the PRODUCT_NAME (not description) exactly as shown",
-  "reasoning": "why this is a good match"
-}}
-
-IMPORTANT: Return the product_index (0-based) and the PRODUCT_NAME part only (before the | separator), not the description.
-
-If no product matches, set found=false and explain why."""
-
-
-EXTRACT_CART_PROMPT = """Extract cart information from this checkout page content.
-
-Page text:
-{page_text}
-
-Return JSON:
-{{
-  "items": [
-    {{
-      "title": "Product name",
-      "price_cents": 1999,
-      "quantity": 1
-    }}
-  ],
-  "subtotal_cents": 1999,
-  "tax_cents": null,
-  "shipping_cents": null,
-  "total_cents": 1999
-}}
-
-Parse prices by removing $ and converting to cents (e.g., $19.99 = 1999).
-If you can't find certain values, use null."""
 
 
 class JoyBuyShopper:
@@ -179,19 +135,13 @@ class JoyBuyShopper:
         # Debug: log what products we found
         logger.debug(f"Available products:\n{products_text}")
 
-        # Ask LLM to find the best match
-        prompt = FIND_PRODUCT_PROMPT.format(
-            products_text=products_text,
-            item_description=item.description,
-        )
-
+        # Ask LLM to find the best match using prompt management
         result = await self.keywords.complete(
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": "Which product should I add?"},
-            ],
-            model="gpt-4o-mini",
-            prompt_id="find_product",
+            prompt_id=PROMPT_IDS["find_product"],
+            variables={
+                "products_text": products_text,
+                "item_description": item.description,
+            },
             metadata={"stage": "find_product", "item": item.description},
         )
 
@@ -351,15 +301,10 @@ class JoyBuyShopper:
         logger.info(f"Cart page URL: {current_url}")
         logger.debug(f"Cart page content: {page_text[:500]}...")
 
-        # Ask LLM to extract cart data
-        prompt = EXTRACT_CART_PROMPT.format(page_text=page_text)
+        # Ask LLM to extract cart data using prompt management
         cart_data = await self.keywords.complete(
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": "Extract the cart information."},
-            ],
-            model="gpt-4o",
-            prompt_id="cart_extraction",
+            prompt_id=PROMPT_IDS["cart_extraction"],
+            variables={"page_text": page_text},
             metadata={"stage": "cart_extraction"},
         )
 
