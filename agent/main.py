@@ -63,6 +63,8 @@ async def run_agent(
     output_dir: Path,
     headless: bool = False,
     api_key: str | None = None,
+    domain: str | None = None,
+    instructions: str | None = None,
 ) -> AgentOutput:
     """
     Run the shopping agent with the given requirements.
@@ -72,6 +74,8 @@ async def run_agent(
         output_dir: Directory to write output JSON files
         headless: Run browser in headless mode
         api_key: Keywords AI API key (defaults to env var)
+        domain: Custom merchant domain URL
+        instructions: Custom instructions to guide the agent
 
     Returns:
         AgentOutput with plan, cart, and validation result
@@ -103,7 +107,13 @@ async def run_agent(
         logger.info("STEP 2: Shopping autonomously...")
         logger.info("=" * 50)
 
-        shopper = JoyBuyShopper(plan, keywords, headless=headless)
+        shopper = JoyBuyShopper(
+            plan, 
+            keywords, 
+            headless=headless,
+            domain=domain,
+            instructions=instructions,
+        )
         cart = await shopper.shop()
 
         logger.info(f"Cart total: ${cart.totals.total_cents / 100:.2f}")
@@ -199,6 +209,22 @@ Examples:
         help="Enable verbose/debug logging",
     )
 
+    parser.add_argument(
+        "-d",
+        "--domain",
+        type=str,
+        default=None,
+        help="Custom merchant domain URL (defaults to https://joy-buy-test.lovable.app)",
+    )
+
+    parser.add_argument(
+        "-i",
+        "--instructions",
+        type=str,
+        default=None,
+        help="Custom instructions to guide the shopping agent",
+    )
+
     args = parser.parse_args()
 
     # Load .env file
@@ -220,6 +246,10 @@ Examples:
     print(f"Requirements: {args.requirements}")
     print(f"Output dir:   {args.output_dir}")
     print(f"Headless:     {args.headless}")
+    if args.domain:
+        print(f"Domain:       {args.domain}")
+    if args.instructions:
+        print(f"Instructions: {args.instructions}")
     print()
 
     # Run agent
@@ -230,6 +260,8 @@ Examples:
                 output_dir=args.output_dir,
                 headless=args.headless,
                 api_key=args.api_key,
+                domain=args.domain,
+                instructions=args.instructions,
             )
         )
 

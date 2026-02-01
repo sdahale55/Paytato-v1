@@ -21,25 +21,31 @@ logger = logging.getLogger(__name__)
 
 
 class JoyBuyShopper:
-    """Autonomous shopper for joy-buy-test.lovable.app mock store.
+    """Autonomous shopper for e-commerce stores.
     
-    This store has a simple layout:
+    Default store is joy-buy-test.lovable.app but can be customized via domain parameter.
+    
+    The store typically has a simple layout:
     - Home page lists all products with "Add" buttons
     - No search functionality
     - Cart accessible via /cart link
     """
 
-    BASE_URL = "https://joy-buy-test.lovable.app"
+    DEFAULT_DOMAIN = "https://joy-buy-test.lovable.app"
 
     def __init__(
         self,
         plan: ShoppingPlan,
         keywords_client: KeywordsClient,
         headless: bool = False,
+        domain: str | None = None,
+        instructions: str | None = None,
     ):
         self.plan = plan
         self.keywords = keywords_client
         self.headless = headless
+        self.base_url = domain.rstrip("/") if domain else self.DEFAULT_DOMAIN
+        self.instructions = instructions
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
         self._page: Page | None = None
@@ -63,8 +69,8 @@ class JoyBuyShopper:
 
             try:
                 # Navigate to store
-                logger.info(f"Navigating to {self.BASE_URL}")
-                await self._page.goto(self.BASE_URL, wait_until="networkidle")
+                logger.info(f"Navigating to {self.base_url}")
+                await self._page.goto(self.base_url, wait_until="networkidle")
                 await self._page.wait_for_timeout(2000)  # Let React hydrate
 
                 # Get all available products on the page
@@ -291,7 +297,7 @@ class JoyBuyShopper:
         except Exception:
             try:
                 # Fallback to direct navigation
-                await self._page.goto(f"{self.BASE_URL}/cart", wait_until="networkidle")
+                await self._page.goto(f"{self.base_url}/cart", wait_until="networkidle")
             except Exception:
                 logger.warning("Could not navigate to cart")
 
@@ -342,7 +348,7 @@ class JoyBuyShopper:
 
         cart = CartJson(
             plan_id=self.plan.plan_id,
-            merchant_origin=self.BASE_URL,
+            merchant_origin=self.base_url,
             checkout_url=current_url,
             items=items,
             totals=totals,
