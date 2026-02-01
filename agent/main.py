@@ -49,6 +49,18 @@ async def create_shopping_plan(
         if plan_data["budget"].get("max_total_cents") is None:
             plan_data["budget"]["max_total_cents"] = 100000
 
+    # Handle missing or null approval rules gracefully
+    approval_rules = plan_data.get("approval_rules")
+    if not isinstance(approval_rules, dict):
+        approval_rules = {}
+    if approval_rules.get("auto_approve_under_cents") is None:
+        approval_rules["auto_approve_under_cents"] = 0
+    if approval_rules.get("require_email_approval") is None:
+        approval_rules["require_email_approval"] = True
+    if approval_rules.get("notify_on_substitution") is None:
+        approval_rules["notify_on_substitution"] = True
+    plan_data["approval_rules"] = approval_rules
+
     plan = ShoppingPlan(**plan_data)
     logger.info(f"Created plan with {len(plan.items)} items")
     budget_display = plan.budget.effective_max_total_cents / 100

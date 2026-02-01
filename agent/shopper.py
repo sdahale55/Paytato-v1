@@ -318,11 +318,25 @@ class JoyBuyShopper:
             metadata={"stage": "cart_extraction"},
         )
 
+        # Normalize cart_data to a dict shape.
+        if isinstance(cart_data, list):
+            cart_data = {"items": cart_data}
+        elif cart_data is None:
+            cart_data = {}
+        elif not isinstance(cart_data, dict):
+            logger.warning(f"Unexpected cart data type: {type(cart_data)}")
+            cart_data = {}
+
         logger.info(f"Extracted cart data: {cart_data}")
 
         # Build CartJson from extracted data
         items = []
-        for i, item_data in enumerate(cart_data.get("items", [])):
+        items_data = cart_data.get("items", [])
+        if not isinstance(items_data, list):
+            logger.warning("Cart items is not a list, defaulting to empty.")
+            items_data = []
+
+        for i, item_data in enumerate(items_data):
             # Try to match with plan items
             plan_item_id = None
             if i < len(self.plan.items):
