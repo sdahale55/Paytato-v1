@@ -7,11 +7,13 @@ import logging
 
 from .keywords import KeywordsClient
 from .prompts import PROMPT_IDS
+from .tracing import task
 from .types import CartJson, ShoppingPlan, ValidationResult
 
 logger = logging.getLogger(__name__)
 
 
+@task(name="validate_cart_against_plan")
 async def validate_cart(
     plan: ShoppingPlan,
     cart: CartJson,

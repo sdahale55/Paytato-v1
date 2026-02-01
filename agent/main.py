@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 from .keywords import KeywordsClient
 from .prompts import PROMPT_IDS
 from .shopper import JoyBuyShopper
+from .tracing import workflow, task
 from .types import AgentOutput, Budget, ShoppingPlan
 from .validator import validate_cart
 
@@ -27,6 +28,36 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+@task(name="intake_requirements_to_plan")
+async def create_shopping_plan(
+    requirements: str,
+    keywords: KeywordsClient,
+) -> ShoppingPlan:
+    """Convert natural language requirements into a structured shopping plan."""
+    logger.info("Converting requirements to shopping plan...")
+
+    plan_data = await keywords.complete(
+        prompt_id=PROMPT_IDS["shopping_intake_to_plan"],
+        variables={"user_requirements": requirements},
+        metadata={"stage": "intake_plan"},
+    )
+
+    # Handle missing or null budget gracefully
+    if "budget" not in plan_data or plan_data["budget"] is None:
+        plan_data["budget"] = {"max_total_cents": 100000, "currency": "USD"}
+    else:
+        if plan_data["budget"].get("max_total_cents") is None:
+            plan_data["budget"]["max_total_cents"] = 100000
+
+    plan = ShoppingPlan(**plan_data)
+    logger.info(f"Created plan with {len(plan.items)} items")
+    budget_display = plan.budget.effective_max_total_cents / 100
+    logger.info(f"Budget: ${budget_display:.2f} {plan.budget.currency}")
+
+    return plan
+
+
+@workflow(name="shopping_agent_workflow")
 async def run_agent(
     requirements: str,
     output_dir: Path,
@@ -59,25 +90,7 @@ async def run_agent(
         logger.info("STEP 1: Converting requirements to shopping plan...")
         logger.info("=" * 50)
 
-        plan_data = await keywords.complete(
-            prompt_id=PROMPT_IDS["shopping_intake_to_plan"],
-            variables={"user_requirements": requirements},
-            metadata={"stage": "intake_plan"},
-        )
-
-        # Parse into ShoppingPlan
-        # Handle missing or null budget gracefully
-        if "budget" not in plan_data or plan_data["budget"] is None:
-            plan_data["budget"] = {"max_total_cents": 100000, "currency": "USD"}
-        else:
-            # Handle null max_total_cents from LLM
-            if plan_data["budget"].get("max_total_cents") is None:
-                plan_data["budget"]["max_total_cents"] = 100000
-
-        plan = ShoppingPlan(**plan_data)
-        logger.info(f"Created plan with {len(plan.items)} items")
-        budget_display = plan.budget.effective_max_total_cents / 100
-        logger.info(f"Budget: ${budget_display:.2f} {plan.budget.currency}")
+        plan = await create_shopping_plan(requirements, keywords)
 
         # Save plan
         plan_path = output_dir / "shopping_plan.json"

@@ -11,6 +11,7 @@ from playwright.async_api import Page, async_playwright
 
 from .keywords import KeywordsClient
 from .prompts import PROMPT_IDS
+from .tracing import task
 from .types import CartItem, CartJson, CartTotals, ShoppingItem, ShoppingPlan
 
 if TYPE_CHECKING:
@@ -44,6 +45,7 @@ class JoyBuyShopper:
         self._page: Page | None = None
         self._added_items: list[CartItem] = []
 
+    @task(name="shopping_browse_and_add")
     async def shop(self) -> CartJson:
         """
         Execute the shopping plan and return a CartJson.
@@ -122,6 +124,7 @@ class JoyBuyShopper:
         
         return products
 
+    @task(name="find_product_match")
     async def _add_item_to_cart(self, item: ShoppingItem, products: list[dict]) -> None:
         """Add a single item to the cart by finding the best matching product."""
         logger.info(f"Looking for: {item.description} (quantity: {item.quantity})")
@@ -276,6 +279,7 @@ class JoyBuyShopper:
         # This prevents adding wrong items to cart
         logger.warning(f"Could not find Add button for product: {product_name}")
 
+    @task(name="extract_cart_state")
     async def _extract_cart_state(self) -> CartJson:
         """Extract cart state from the checkout page."""
         # Navigate to cart
