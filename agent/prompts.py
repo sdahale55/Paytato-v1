@@ -6,8 +6,8 @@ This file contains only the prompt IDs for reference.
 
 # Prompt IDs from Keywords AI dashboard
 PROMPT_IDS = {
-    "shopping_intake_to_plan": "283297bd15a84b2fb90e1451e41fd30e",
-    "find_product": "455dafae722d4bb2828658709038e027",
-    "cart_extraction": "3eed1b05ac394cfabbd7ae38cd05a911",
-    "cart_vs_plan_validator": "02a5fb916fd64829beacd7f957dc54bd",
+    "shopping_intake_to_plan": "090978d2dbab42aa8d47bdbb3fe74b5b",
+    "find_product": "9d97fe3bb6554e0687e84223e712d687",
+    "cart_extraction": "b4d6d4f71ba74cda861ec0006ecba50e",
+    "cart_vs_plan_validator": "67add938142a4c2583e8d82ebb229cae",
 }
