@@ -89,45 +89,59 @@ class JoyBuyShopper:
                 if self._browser:
                     await self._browser.close()
 
+    @task(name="collect_products_catalog")
     async def _get_available_products(self) -> list[dict]:
         """Extract all available products from the page."""
         # The store shows products in a grid with title, description, price, and Add button
         # We'll extract product cards
-        
+
         products = []
-        
+
         # Try to find product cards - they typically have a structure with title, price, and button
         # Looking at the page content, products seem to follow pattern:
         # CATEGORY\nProduct Name\nDescription\n$XX.XX\nAdd
-        
-        page_text = await self._page.inner_text("body")
-        
+
+        page_text = await self._get_page_text()
+
         # Parse products from the page text
         # Pattern: products have category, name, description, price, Add
         lines = page_text.split("\n")
-        
+
+        products = await self._parse_products_from_lines(lines)
+
+        return products
+
+    @task(name="get_page_text")
+    async def _get_page_text(self) -> str:
+        """Return raw page text for catalog parsing."""
+        return await self._page.inner_text("body")
+
+    @task(name="parse_products_from_lines")
+    async def _parse_products_from_lines(self, lines: list[str]) -> list[dict]:
+        """Parse product entries from raw page lines."""
+        products: list[dict] = []
         i = 0
         while i < len(lines):
             line = lines[i].strip()
             # Look for price pattern
             if line.startswith("$"):
-                # Found a price, backtrack to find product info
                 price = line
-                # Product name is typically 2 lines before price
                 if i >= 2:
-                    name = lines[i-2].strip() if i >= 2 else ""
-                    description = lines[i-1].strip() if i >= 1 else ""
-                    category = lines[i-3].strip() if i >= 3 else ""
-                    
+                    name = lines[i - 2].strip() if i >= 2 else ""
+                    description = lines[i - 1].strip() if i >= 1 else ""
+                    category = lines[i - 3].strip() if i >= 3 else ""
+
                     if name and not name.startswith("$"):
-                        products.append({
-                            "name": name,
-                            "description": description,
-                            "price": price,
-                            "category": category,
-                        })
+                        products.append(
+                            {
+                                "name": name,
+                                "description": description,
+                                "price": price,
+                                "category": category,
+                            }
+                        )
             i += 1
-        
+
         return products
 
     @task(name="find_product_match")
@@ -136,45 +150,77 @@ class JoyBuyShopper:
         logger.info(f"Looking for: {item.description} (quantity: {item.quantity})")
 
         # Format products for LLM with clear index and structure
-        products_text = "\n".join([
-            f"{i}. {p['name']} | {p['description']} | {p['price']}"
-            for i, p in enumerate(products)
-        ])
+        products_text = await self._format_products_text(products)
         
         # Debug: log what products we found
         logger.debug(f"Available products:\n{products_text}")
 
         # Ask LLM to find the best match using prompt management
-        result = await self.keywords.complete(
-            prompt_id=PROMPT_IDS["find_product"],
-            variables={
-                "products_text": products_text,
-                "item_description": item.description,
-            },
-            metadata={"stage": "find_product", "item": item.description},
-        )
+        result = await self._run_find_product_prompt(item.description, products_text)
 
         if not result.get("found", False):
             logger.warning(f"No matching product found for: {item.description}")
             logger.warning(f"Reason: {result.get('reasoning', 'unknown')}")
             return
 
-        product_index = result.get("product_index", -1)
-        product_name = result.get("product_name", "")
+        product_index, product_name = await self._select_product_match(result, products)
         logger.info(f"Found match at index {product_index}: {product_name}")
         logger.info(f"Reason: {result.get('reasoning', '')}")
 
-        # Use product name from our parsed list if index is valid
+        # Click the Add button for this product (respecting quantity)
+        await self._add_quantity(product_name, product_index, item.quantity)
+
+    @task(name="format_products_text")
+    async def _format_products_text(self, products: list[dict]) -> str:
+        """Build LLM-friendly product catalog text."""
+        return "\n".join(
+            [
+                f"{i}. {p['name']} | {p['description']} | {p['price']}"
+                for i, p in enumerate(products)
+            ]
+        )
+
+    @task(name="run_find_product_prompt")
+    async def _run_find_product_prompt(self, description: str, products_text: str) -> dict:
+        """Call Keywords AI to match a product."""
+        return await self.keywords.complete(
+            prompt_id=PROMPT_IDS["find_product"],
+            variables={
+                "products_text": products_text,
+                "item_description": description,
+            },
+            metadata={"stage": "find_product", "item": description},
+        )
+
+    @task(name="select_product_match")
+    async def _select_product_match(
+        self,
+        result: dict,
+        products: list[dict],
+    ) -> tuple[int, str]:
+        """Normalize product match output."""
+        product_index = result.get("product_index", -1)
+        product_name = result.get("product_name", "")
+
         if 0 <= product_index < len(products):
             actual_product = products[product_index]
             product_name = actual_product["name"]
             logger.info(f"Using product name from index: {product_name}")
 
-        # Click the Add button for this product (respecting quantity)
-        for i in range(item.quantity):
+        return product_index, product_name
+
+    @task(name="add_item_quantity")
+    async def _add_quantity(
+        self,
+        product_name: str,
+        product_index: int,
+        quantity: int,
+    ) -> None:
+        """Add item quantity to cart."""
+        for i in range(quantity):
             await self._click_add_for_product(product_name, product_index)
-            if item.quantity > 1:
-                logger.info(f"Added {i + 1}/{item.quantity} of: {product_name}")
+            if quantity > 1:
+                logger.info(f"Added {i + 1}/{quantity} of: {product_name}")
 
     async def _click_add_for_product(self, product_name: str, product_index: int = -1) -> None:
         """Click the Add button next to a specific product."""
@@ -290,26 +336,8 @@ class JoyBuyShopper:
         """Extract cart state from the checkout page."""
         # Navigate to cart
         logger.info("Navigating to cart...")
-        
-        try:
-            # Try clicking cart link
-            await self._page.click('a[href="/cart"]', timeout=3000)
-        except Exception:
-            try:
-                # Fallback to direct navigation
-                await self._page.goto(f"{self.base_url}/cart", wait_until="networkidle")
-            except Exception:
-                logger.warning("Could not navigate to cart")
-
-        await self._page.wait_for_timeout(2000)
-
-        # Get page content
-        page_text = await self._page.inner_text("body")
-        page_text = re.sub(r"\s+", " ", page_text).strip()[:3000]
-        current_url = self._page.url
-
-        logger.info(f"Cart page URL: {current_url}")
-        logger.debug(f"Cart page content: {page_text[:500]}...")
+        await self._navigate_to_cart()
+        page_text, current_url = await self._get_cart_page_snapshot()
 
         # Ask LLM to extract cart data using prompt management
         cart_data = await self.keywords.complete(
@@ -318,11 +346,18 @@ class JoyBuyShopper:
             metadata={"stage": "cart_extraction"},
         )
 
+        cart_data = await self._normalize_cart_data(cart_data)
+
         logger.info(f"Extracted cart data: {cart_data}")
 
         # Build CartJson from extracted data
         items = []
-        for i, item_data in enumerate(cart_data.get("items", [])):
+        items_data = cart_data.get("items", [])
+        if not isinstance(items_data, list):
+            logger.warning("Cart items is not a list, defaulting to empty.")
+            items_data = []
+
+        for i, item_data in enumerate(items_data):
             # Try to match with plan items
             plan_item_id = None
             if i < len(self.plan.items):
@@ -359,3 +394,42 @@ class JoyBuyShopper:
         cart.compute_fingerprint()
 
         return cart
+
+    @task(name="cart_navigation")
+    async def _navigate_to_cart(self) -> None:
+        """Navigate to cart page with fallbacks."""
+        try:
+            # Try clicking cart link
+            await self._page.click('a[href="/cart"]', timeout=3000)
+        except Exception:
+            try:
+                # Fallback to direct navigation
+                await self._page.goto(f"{self.base_url}/cart", wait_until="networkidle")
+            except Exception:
+                logger.warning("Could not navigate to cart")
+
+        await self._page.wait_for_timeout(2000)
+
+    @task(name="cart_page_snapshot")
+    async def _get_cart_page_snapshot(self) -> tuple[str, str]:
+        """Capture cart page text and URL for extraction."""
+        page_text = await self._page.inner_text("body")
+        page_text = re.sub(r"\s+", " ", page_text).strip()[:3000]
+        current_url = self._page.url
+
+        logger.info(f"Cart page URL: {current_url}")
+        logger.debug(f"Cart page content: {page_text[:500]}...")
+
+        return page_text, current_url
+
+    @task(name="normalize_cart_data")
+    async def _normalize_cart_data(self, cart_data) -> dict:
+        """Normalize LLM cart data into dict shape."""
+        if isinstance(cart_data, list):
+            return {"items": cart_data}
+        if cart_data is None:
+            return {}
+        if not isinstance(cart_data, dict):
+            logger.warning(f"Unexpected cart data type: {type(cart_data)}")
+            return {}
+        return cart_data

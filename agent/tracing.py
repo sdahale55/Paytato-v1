@@ -8,11 +8,24 @@ from __future__ import annotations
 
 import os
 import logging
+from pathlib import Path
+
+from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
+# Load .env early so tracing can read API key.
+env_path = Path(__file__).parent.parent / ".env"
+if env_path.exists():
+    load_dotenv(env_path)
+
 # Initialize Keywords AI Telemetry
-# The SDK reads KEYWORDSAI_API_KEY from environment automatically
+# The SDK reads KEYWORDSAI_API_KEY from environment automatically.
+# If the app uses KEYWORDS_API_KEY, map it for tracing.
+if not os.getenv("KEYWORDSAI_API_KEY"):
+    api_key = os.getenv("KEYWORDS_API_KEY")
+    if api_key:
+        os.environ["KEYWORDSAI_API_KEY"] = api_key
 try:
     from keywordsai_tracing.decorators import workflow, task
     from keywordsai_tracing.main import KeywordsAITelemetry

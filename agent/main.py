@@ -1,4 +1,4 @@
-"""Shopping Agent CLI - Main entry point."""
+"""Shopping Agent CLI - Main entry point with Paytato integration."""
 
 from __future__ import annotations
 
@@ -13,10 +13,11 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from .keywords import KeywordsClient
+from .paytato import PaytatoClient
 from .prompts import PROMPT_IDS
 from .shopper import JoyBuyShopper
 from .tracing import workflow, task
-from .types import AgentOutput, Budget, ShoppingPlan
+from .types import AgentOutput, Budget, CartJson, ShoppingPlan
 from .validator import validate_cart
 
 # Setup logging
@@ -49,12 +50,52 @@ async def create_shopping_plan(
         if plan_data["budget"].get("max_total_cents") is None:
             plan_data["budget"]["max_total_cents"] = 100000
 
+    # Handle missing or null approval rules gracefully
+    approval_rules = plan_data.get("approval_rules")
+    if not isinstance(approval_rules, dict):
+        approval_rules = {}
+    if approval_rules.get("auto_approve_under_cents") is None:
+        approval_rules["auto_approve_under_cents"] = 0
+    if approval_rules.get("require_email_approval") is None:
+        approval_rules["require_email_approval"] = True
+    if approval_rules.get("notify_on_substitution") is None:
+        approval_rules["notify_on_substitution"] = True
+    plan_data["approval_rules"] = approval_rules
+
     plan = ShoppingPlan(**plan_data)
     logger.info(f"Created plan with {len(plan.items)} items")
     budget_display = plan.budget.effective_max_total_cents / 100
     logger.info(f"Budget: ${budget_display:.2f} {plan.budget.currency}")
 
     return plan
+
+
+@task(name="save_json_file")
+async def save_json_file(path: Path, payload: dict) -> None:
+    """Persist structured output to disk."""
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+
+@task(name="build_agent_output")
+async def build_agent_output(
+    plan: ShoppingPlan,
+    cart: CartJson,
+    validation,
+) -> AgentOutput:
+    """Build final AgentOutput model."""
+    return AgentOutput(
+        shopping_plan=plan,
+        cart=cart,
+        validation=validation,
+        success=validation.decision != "REJECT",
+    )
+
+
+@task(name="ensure_output_dir")
+async def ensure_output_dir(output_dir: Path) -> None:
+    """Ensure output directory exists."""
+    output_dir.mkdir(parents=True, exist_ok=True)
 
 
 @workflow(name="shopping_agent_workflow")
@@ -65,7 +106,8 @@ async def run_agent(
     api_key: str | None = None,
     domain: str | None = None,
     instructions: str | None = None,
-) -> AgentOutput:
+    paytato: PaytatoClient | None = None,
+) -> tuple[AgentOutput, dict | None]:
     """
     Run the shopping agent with the given requirements.
 
@@ -76,9 +118,10 @@ async def run_agent(
         api_key: Keywords AI API key (defaults to env var)
         domain: Custom merchant domain URL
         instructions: Custom instructions to guide the agent
+        paytato: PaytatoClient instance for payment orchestration
 
     Returns:
-        AgentOutput with plan, cart, and validation result
+        Tuple of (AgentOutput, intent_result) - intent_result is None if no Paytato client
     """
     # Get API key
     if not api_key:
@@ -86,7 +129,14 @@ async def run_agent(
     if not api_key:
         raise ValueError("KEYWORDS_API_KEY not set. Check .env file.")
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    await ensure_output_dir(output_dir)
+
+    # Step 0: Start Paytato run if client provided
+    if paytato:
+        logger.info("=" * 50)
+        logger.info("STEP 0: Starting Paytato agent run...")
+        logger.info("=" * 50)
+        await paytato.start_run(force=True)
 
     async with KeywordsClient(api_key) as keywords:
         # Step 1: Convert requirements to shopping plan
@@ -98,8 +148,7 @@ async def run_agent(
 
         # Save plan
         plan_path = output_dir / "shopping_plan.json"
-        with open(plan_path, "w") as f:
-            json.dump(plan.model_dump(), f, indent=2)
+        await save_json_file(plan_path, plan.model_dump())
         logger.info(f"Saved plan to {plan_path}")
 
         # Step 2: Shop autonomously
@@ -121,8 +170,7 @@ async def run_agent(
 
         # Save cart
         cart_path = output_dir / "cart.json"
-        with open(cart_path, "w") as f:
-            json.dump(cart.model_dump(), f, indent=2)
+        await save_json_file(cart_path, cart.model_dump())
         logger.info(f"Saved cart to {cart_path}")
 
         # Step 3: Validate cart against plan
@@ -139,25 +187,34 @@ async def run_agent(
 
         # Save validation
         validation_path = output_dir / "validation.json"
-        with open(validation_path, "w") as f:
-            json.dump(validation.model_dump(), f, indent=2)
+        await save_json_file(validation_path, validation.model_dump())
         logger.info(f"Saved validation to {validation_path}")
 
         # Build final output
-        output = AgentOutput(
-            shopping_plan=plan,
-            cart=cart,
-            validation=validation,
-            success=validation.decision != "REJECT",
-        )
+        output = await build_agent_output(plan, cart, validation)
 
         # Save complete output
         output_path = output_dir / "agent_output.json"
-        with open(output_path, "w") as f:
-            json.dump(output.model_dump(), f, indent=2)
+        await save_json_file(output_path, output.model_dump())
         logger.info(f"Saved complete output to {output_path}")
 
-        return output
+        # Step 4: Submit payment intent to Paytato
+        intent_result = None
+        if paytato and output.success:
+            logger.info("=" * 50)
+            logger.info("STEP 4: Submitting payment intent to Paytato...")
+            logger.info("=" * 50)
+            
+            intent_result = await paytato.submit_intent(plan, cart)
+            
+            # Save intent result
+            intent_path = output_dir / "paytato_intent.json"
+            await save_json_file(intent_path, intent_result)
+            logger.info(f"Saved Paytato intent to {intent_path}")
+        elif paytato and not output.success:
+            logger.warning("Skipping Paytato intent submission - validation failed")
+
+        return output, intent_result
 
 
 def main() -> None:
@@ -253,9 +310,24 @@ Examples:
     print()
 
     # Run agent
-    try:
-        output = asyncio.run(
-            run_agent(
+    async def run_with_paytato() -> tuple[AgentOutput, dict | None]:
+        """Run agent with Paytato integration."""
+        paytato_key = os.getenv("PAYTATO_API_KEY")
+        
+        if paytato_key:
+            async with PaytatoClient(paytato_key) as paytato:
+                return await run_agent(
+                    requirements=args.requirements,
+                    output_dir=args.output_dir,
+                    headless=args.headless,
+                    api_key=args.api_key,
+                    domain=args.domain,
+                    instructions=args.instructions,
+                    paytato=paytato,
+                )
+        else:
+            logger.warning("PAYTATO_API_KEY not set - running without Paytato integration")
+            return await run_agent(
                 requirements=args.requirements,
                 output_dir=args.output_dir,
                 headless=args.headless,
@@ -263,7 +335,9 @@ Examples:
                 domain=args.domain,
                 instructions=args.instructions,
             )
-        )
+
+    try:
+        output, intent_result = asyncio.run(run_with_paytato())
 
         # Print summary
         print()
@@ -281,6 +355,26 @@ Examples:
         print(f"  - {args.output_dir}/cart.json")
         print(f"  - {args.output_dir}/validation.json")
         print(f"  - {args.output_dir}/agent_output.json")
+        
+        # Print Paytato intent result
+        if intent_result:
+            print(f"  - {args.output_dir}/paytato_intent.json")
+            print()
+            print("=" * 60)
+            print("  PAYTATO INTENT SUBMITTED")
+            print("=" * 60)
+            print()
+            print(f"Intent ID:  {intent_result.get('intentId')}")
+            print(f"Status:     {intent_result.get('status')}")
+            print()
+            print("Agent has submitted payment intent to Paytato and is now shutting down.")
+            print("Payment approval will be handled by Paytato.")
+        else:
+            print()
+            if not output.success:
+                print("Note: Payment intent NOT submitted (validation failed)")
+            elif not os.getenv("PAYTATO_API_KEY"):
+                print("Note: PAYTATO_API_KEY not set - no intent submitted")
         print()
 
         if not output.success:
